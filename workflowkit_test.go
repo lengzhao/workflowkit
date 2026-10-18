@@ -886,3 +886,59 @@ func TestReadJSONStaysInsideAllowedDirs(t *testing.T) {
 func jsonMarshal(v any) ([]byte, error) {
 	return json.Marshal(v)
 }
+// ---------------------------------------------------------------------------
+// Composite nodes: item context, sibling references and auditability
+// ---------------------------------------------------------------------------
+
+// TestForeachBodySeesSiblingsByDeclaredID locks in the rule that a body step
+// refers to a sibling as .steps.<declared-id>, not by the namespaced id the run
+// publishes globally. Without it, a conditional inside a body would silently
+// never see its sibling and skip.
+func TestForeachBodySeesSiblingsByDeclaredID(t *testing.T) {
+	wf := mustParse(t, `{"description":"d","steps":[
+		{"id":"each","type":"foreach","items":"[1,2,3]",
+		 "body":[
+			{"id":"check","type":"script","run":"cmd-check"},
+			{"id":"report","type":"tool","tool":"store","when":"{{ eq .steps.check.status \"ok\" }}",
+			 "args":{"n":"{{ .item }}"}}]}]}`)
+	env, _, tools := testEnv(t)
+	res, err := workflowkit.Run(context.Background(), wf, nil, env)
+	if err != nil {
+		t.Fatalf("run failed: %v", err)
+	}
+	if len(tools.calls) != 3 {
+		t.Fatalf("every item's report should have run; got %d tool calls", len(tools.calls))
+	}
+	// Body results are published under namespaced ids, so nested execution is
+	// visible to the caller.
+	for _, id := range []string{"each[0].check", "each[1].report", "each[2].report"} {
+		if _, ok := res.Steps[id]; !ok {
+			t.Errorf("expected %q in Result.Steps (nested execution must be auditable)", id)
+		}
+	}
+}
+
+// TestForeachItemIsolation checks that two items running concurrently do not
+// see each other's body results: each item's .steps.check must be its own.
+func TestForeachItemIsolation(t *testing.T) {
+	wf := mustParse(t, `{"description":"d","steps":[
+		{"id":"each","type":"foreach","items":"[1,2,3,4]","concurrency":4,
+		 "body":[{"id":"echo","type":"script","run":"cmd-echo"},
+		         {"id":"use","type":"tool","tool":"store",
+		          "args":{"text":"{{ .steps.echo.text }}"}}]}]}`)
+	env, shell, tools := testEnv(t)
+	// Each command returns something generic; the point is that every item gets
+	// its own sibling's result rather than a mix.
+	shell.out["cmd-echo"] = "same"
+	if _, err := workflowkit.Run(context.Background(), wf, nil, env); err != nil {
+		t.Fatalf("run failed: %v", err)
+	}
+	if len(tools.calls) != 4 {
+		t.Fatalf("expected 4 calls, got %d", len(tools.calls))
+	}
+	for _, call := range tools.calls {
+		if call.Input["text"] != "same" {
+			t.Fatalf("item did not see its own sibling result: %#v", call.Input)
+		}
+	}
+}

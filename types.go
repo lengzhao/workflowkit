@@ -3,6 +3,7 @@ package workflowkit
 import (
 	"context"
 	"fmt"
+	"sync"
 )
 
 // Node is one executable step. A node type's constructor returns a value
@@ -55,7 +56,35 @@ type Ctx struct {
 	// RunDir is this run's artifact directory (created by the core).
 	RunDir string
 
-	exec *executor
+	exec  *executor
+	local *localSteps
+}
+
+// localSteps holds one composite body's results under their declared ids, so a
+// body step can refer to a sibling as .steps.<declared-id> instead of the
+// namespaced id the run publishes globally (each[0].check). Each item gets its
+// own, which is what makes the alias unambiguous.
+type localSteps struct {
+	mu sync.Mutex
+	m  map[string]StepResult
+}
+
+func newLocalSteps() *localSteps { return &localSteps{m: map[string]StepResult{}} }
+
+func (l *localSteps) put(id string, r StepResult) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.m[id] = r
+}
+
+func (l *localSteps) snapshot() map[string]StepResult {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	out := make(map[string]StepResult, len(l.m))
+	for id, r := range l.m {
+		out[id] = r
+	}
+	return out
 }
 
 // StepView reads the results of finished steps. It is only populated with
@@ -187,6 +216,7 @@ type Tracer interface {
 	StartRun(ctx context.Context, runID, workflowID string, inputs map[string]any) (context.Context, func(err error))
 	StartStep(ctx context.Context, stepID, nodeType string) (context.Context, func(Output, error))
 }
+
 // Render renders a template string against this step's context.
 func (c *Ctx) Render(text string) (string, error) {
 	return renderTemplate(c.StepID, text, c.data())
@@ -227,7 +257,7 @@ func (c *Ctx) RunStep(ctx context.Context, step Step) (StepResult, error) {
 	if c.exec == nil {
 		return StepResult{}, fmt.Errorf("workflowkit: step %q: no executor (node built outside Run)", c.StepID)
 	}
-	return c.exec.runStepNested(ctx, step, c.Item, c.Index), nil
+	return c.exec.runStepNested(ctx, step, c.Item, c.Index, c.local), nil
 }
 
 // RunSteps executes sub-steps in declaration order, stopping at the first
@@ -236,6 +266,8 @@ func (c *Ctx) RunSteps(ctx context.Context, steps []Step) ([]StepResult, error) 
 	if c.exec == nil {
 		return nil, fmt.Errorf("workflowkit: step %q: no executor (node built outside Run)", c.StepID)
 	}
+	// A fresh local view per call: this body's steps see each other by their
+	// declared ids, independent of other items running concurrently.
 	return c.exec.runStepsNested(ctx, steps, c.Item, c.Index)
 }
 
@@ -256,6 +288,13 @@ func (c *Ctx) data() map[string]any {
 			if r, ok := c.Steps.Get(id); ok {
 				steps[id] = stepTemplateData(r)
 			}
+		}
+	}
+	// A composite body's own steps are also reachable by their declared ids, so
+	// a body step writes .steps.check rather than .steps.each[0].check.
+	if c.local != nil {
+		for id, r := range c.local.snapshot() {
+			steps[id] = stepTemplateData(r)
 		}
 	}
 	data := map[string]any{

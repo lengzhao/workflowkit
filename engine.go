@@ -138,7 +138,7 @@ func (ex *executor) run(ctx context.Context) *Result {
 	plan := levels(ex.wf.Steps)
 	if plan == nil {
 		res.Status = "error"
-		res.Err = fmt.Errorf("workflow %q: dependency cycle detected", ex.wf.ID)
+		res.Err = fmt.Errorf("workflow %q: dependency cycle detected", ex.wf.scopeName())
 		return res
 	}
 
@@ -173,7 +173,7 @@ func (ex *executor) run(ctx context.Context) *Result {
 			step := &ex.wf.Steps[idx]
 			r := levelResults[step.ID]
 			if r.Status == "error" && !step.ContinueOnError && failed == nil {
-				failed = fmt.Errorf("workflow %q step %q: %s", ex.wf.ID, step.ID, r.Error)
+				failed = fmt.Errorf("workflow %q step %q: %s", ex.wf.scopeName(), step.ID, r.Error)
 			}
 		}
 		// A failing step aborts the next level; the current level always runs
@@ -184,15 +184,16 @@ func (ex *executor) run(ctx context.Context) *Result {
 	}
 
 	// Publish everything, including steps that never ran because the run
-	// aborted, so the caller sees the whole pipeline.
+	// aborted, so the caller sees the whole pipeline. Composite nodes'
+	// sub-steps are published too, under their namespaced ids (for example
+	// "each[0].check"), so nested execution stays auditable.
 	ex.mu.Lock()
 	res.Steps = make(map[string]StepResult, len(ex.wf.Steps))
 	for _, step := range ex.wf.Steps {
-		if r, ok := ex.results[step.ID]; ok {
-			res.Steps[step.ID] = r
-			continue
-		}
 		res.Steps[step.ID] = StepResult{ID: step.ID, Status: "skipped"}
+	}
+	for id, r := range ex.results {
+		res.Steps[id] = r
 	}
 	ex.mu.Unlock()
 
@@ -202,7 +203,7 @@ func (ex *executor) run(ctx context.Context) *Result {
 		return res
 	}
 	if strings.TrimSpace(ex.wf.Result) != "" {
-		text, err := renderTemplate(ex.wf.ID+".result", ex.wf.Result, ex.templateData())
+		text, err := renderTemplate(ex.wf.scopeName()+".result", ex.wf.Result, ex.templateData())
 		if err != nil {
 			res.Status = "error"
 			res.Err = err
@@ -218,7 +219,7 @@ func (ex *executor) runLevel(ctx context.Context, level []int, concurrency int) 
 	out := make(map[string]StepResult, len(level))
 	if len(level) == 1 {
 		step := &ex.wf.Steps[level[0]]
-		out[step.ID] = ex.runStep(ctx, step, nil, -1)
+		out[step.ID] = ex.runStep(ctx, step, nil, -1, nil)
 		return out
 	}
 	sem := make(chan struct{}, concurrency)
@@ -232,7 +233,7 @@ func (ex *executor) runLevel(ctx context.Context, level []int, concurrency int) 
 			sem <- struct{}{}
 			defer func() { <-sem }()
 			step := &ex.wf.Steps[idx]
-			r := ex.runStep(ctx, step, nil, -1)
+			r := ex.runStep(ctx, step, nil, -1, nil)
 			mu.Lock()
 			out[step.ID] = r
 			mu.Unlock()
@@ -244,15 +245,15 @@ func (ex *executor) runLevel(ctx context.Context, level []int, concurrency int) 
 
 // runStep executes one step: evalWhen, retries, timeout and output capture.
 // item/index carry the foreach context (nil/-1 outside a body).
-func (ex *executor) runStep(ctx context.Context, step *Step, item any, index int) StepResult {
+func (ex *executor) runStep(ctx context.Context, step *Step, item any, index int, local *localSteps) StepResult {
 	start := time.Now()
 	res := StepResult{ID: step.ID, Status: "ok"}
 
-	c := ex.newCtx(step, item, index)
+	c := ex.newCtx(step, item, index, local)
 	data := c.data()
 
 	if strings.TrimSpace(step.When) != "" {
-		ok, err := evalWhen(ex.wf.ID+"."+step.ID, step.When, data)
+		ok, err := evalWhen(ex.wf.scopeName()+"."+step.ID, step.When, data)
 		switch {
 		case err != nil:
 			res.Status = "error"
@@ -340,7 +341,7 @@ func (ex *executor) invoke(ctx context.Context, step *Step, c *Ctx) (Output, err
 }
 
 // newCtx builds the execution context for one step invocation.
-func (ex *executor) newCtx(step *Step, item any, index int) *Ctx {
+func (ex *executor) newCtx(step *Step, item any, index int, local *localSteps) *Ctx {
 	return &Ctx{
 		StepID: step.ID,
 		Cfg:    step.Fields,
@@ -350,6 +351,7 @@ func (ex *executor) newCtx(step *Step, item any, index int) *Ctx {
 		Index:  index,
 		RunDir: ex.runDir,
 		exec:   ex,
+		local:  local,
 	}
 }
 
@@ -444,29 +446,43 @@ func (m mapStepView) IDs() []string {
 // runStepNested executes a step that belongs to a composite node's body, in the
 // body's item context. Because the core runs it, the body step keeps its own
 // when, retry, timeout and continueOnError.
-func (ex *executor) runStepNested(ctx context.Context, step Step, item any, index int) StepResult {
-	res := ex.runStep(ctx, &step, item, index)
+func (ex *executor) runStepNested(ctx context.Context, step Step, item any, index int, local *localSteps) StepResult {
+	res := ex.runStep(ctx, &step, item, index, local)
 	ex.mu.Lock()
 	ex.results[step.ID] = res
 	ex.mu.Unlock()
+	if local != nil {
+		local.put(stripNamespace(step.ID), res)
+	}
 	return res
 }
 
 // runStepsNested executes body steps in declaration order, stopping at the
 // first failure unless that step sets continueOnError.
 func (ex *executor) runStepsNested(ctx context.Context, steps []Step, item any, index int) ([]StepResult, error) {
+	local := newLocalSteps()
 	out := make([]StepResult, 0, len(steps))
 	for i := range steps {
 		if ctx.Err() != nil {
 			return out, ctx.Err()
 		}
-		r := ex.runStepNested(ctx, steps[i], item, index)
+		r := ex.runStepNested(ctx, steps[i], item, index, local)
 		out = append(out, r)
 		if r.Status == "error" && !steps[i].ContinueOnError {
 			return out, fmt.Errorf("step %q: %s", steps[i].ID, r.Error)
 		}
 	}
 	return out, nil
+}
+
+// stripNamespace recovers a body step's declared id from the namespaced id a
+// composite uses for global uniqueness ("each[0].check" -> "check").
+func stripNamespace(id string) string {
+	idx := strings.LastIndex(id, ".")
+	if idx < 0 {
+		return id
+	}
+	return id[idx+1:]
 }
 
 // emit sends a step-level event when a sink is configured.

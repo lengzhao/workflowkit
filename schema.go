@@ -282,6 +282,7 @@ func evalWhen(name, when string, data map[string]any) (bool, error) {
 // ensure parseTemplate stays referenced from this file's package tests when
 // template.go's helper is exercised only through workflow.go.
 var _ = template.New
+
 // ValidateSchema checks a value against a JSON Schema. It is exported for node
 // implementations that need the same validation the core performs.
 func ValidateSchema(schema map[string]any, value any) error {

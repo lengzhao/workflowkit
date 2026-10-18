@@ -31,7 +31,6 @@ type Workflow struct {
 	Path string `json:"-"`
 }
 
-
 // Step is one pipeline stage: common fields plus the node's own fields in
 // Fields.
 type Step struct {
@@ -150,24 +149,35 @@ func Parse(data []byte) (*Workflow, error) {
 // Validate checks an already-built Workflow. Parse calls it.
 func (wf *Workflow) Validate() error { return wf.validate() }
 
+// scopeName is the workflow name used in error messages. An inline definition
+// (parsed from bytes, with no file behind it) has no id yet, so it reports as
+// "(inline)" rather than as an empty string.
+func (wf *Workflow) scopeName() string {
+	if wf.ID != "" {
+		return wf.ID
+	}
+	return "(inline)"
+}
+
 func (wf *Workflow) validate() error {
+	scope := wf.scopeName()
 	if strings.TrimSpace(wf.Description) == "" {
-		return fmt.Errorf("workflow %q: description is required (callers route by it)", wf.ID)
+		return fmt.Errorf("workflow %q: description is required (callers route by it)", scope)
 	}
 	if len(wf.Steps) == 0 {
-		return fmt.Errorf("workflow %q: at least one step is required", wf.ID)
+		return fmt.Errorf("workflow %q: at least one step is required", scope)
 	}
 	if wf.Concurrency < 0 {
-		return fmt.Errorf("workflow %q: concurrency must not be negative", wf.ID)
+		return fmt.Errorf("workflow %q: concurrency must not be negative", scope)
 	}
-	if err := validateStepList(wf.ID, wf.Steps); err != nil {
+	if err := validateStepList(scope, wf.Steps); err != nil {
 		return err
 	}
 	if err := wf.validateGraph(); err != nil {
 		return err
 	}
 	if strings.TrimSpace(wf.Result) != "" {
-		if _, err := parseTemplate(wf.ID+".result", wf.Result, nil); err != nil {
+		if _, err := parseTemplate(scope+".result", wf.Result, nil); err != nil {
 			return err
 		}
 	}

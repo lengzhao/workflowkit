@@ -61,13 +61,11 @@ func (n *node) Run(ctx context.Context, env workflowkit.Env, c *workflowkit.Ctx)
 	if err != nil {
 		return workflowkit.Output{}, fmt.Errorf("agent step %q: %w", c.StepID, err)
 	}
-	meta := map[string]any{}
-	if summary.Session != "" {
-		meta["session"] = summary.Session
-	}
-	if summary.Status != "" {
-		meta["status"] = summary.Status
-	}
-	meta["steps"] = summary.Steps
-	return workflowkit.Output{Text: summary.Text, Meta: meta}, nil
+	// The delegation's metadata goes into Data so a downstream step can read it
+	// with dig, for example: {{ dig .steps.audit.json "session" }}
+	return workflowkit.Output{Text: summary.Text, Data: map[string]any{
+		"session": summary.Session,
+		"status":  summary.Status,
+		"steps":   summary.Steps,
+	}}, nil
 }

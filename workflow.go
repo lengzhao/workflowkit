@@ -231,14 +231,12 @@ func validateStep(scope string, step Step) error {
 			return fail("invalid when template: %v", err)
 		}
 	}
-	if reg.info.Config != nil {
-		if err := validateAgainstSchema(reg.info.Config, step.Fields); err != nil {
-			return fail("config does not match the %s schema: %v", step.Type, err)
-		}
+	if err := reg.cfgSchema.Validate(step.Fields); err != nil {
+		return fail("config does not match the %s schema: %v", step.Type, err)
 	}
 	// Construct once so node-level requirements (a missing field, a bad enum
 	// value) are reported at load time too.
-	if err := CheckConfig(step.Type, step.Fields); err != nil {
+	if err := checkConfig(step.Type, step.Fields); err != nil {
 		return fail("%v", err)
 	}
 	// Sub-steps declared by composite nodes are validated recursively.
@@ -271,6 +269,14 @@ func decodeSteps(raw any) ([]Step, error) {
 		return nil, fmt.Errorf("invalid steps: %w", err)
 	}
 	return steps, nil
+}
+
+// withScopedID returns a copy of the step whose id is scoped, used when a
+// composite body runs under a per-item prefix.
+func (s Step) withScopedID(id string) *Step {
+	next := s
+	next.ID = id
+	return &next
 }
 
 // SubSteps reads a sub-step list from a node's config, for composite nodes.

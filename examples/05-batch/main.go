@@ -34,7 +34,6 @@ func main() {
 
     { "id": "each", "type": "foreach", "dependsOn": ["fetch"],
       "items": "{{ dig .steps.fetch.json \"accounts\" }}",
-      "as": "account",
       "concurrency": 2,
       "onItemError": "continue",
       "body": [
@@ -46,7 +45,7 @@ func main() {
           "args": { "account": "{{ dig .item \"id\" }}" } }
       ] }
   ],
-  "result": "共 {{ dig .steps.each.meta \"count\" }} 个账户，失败 {{ dig .steps.each.meta \"failed\" }} 个"
+  "result": "共 {{ dig .steps.each.json \"count\" }} 个账户，失败 {{ dig .steps.each.json \"failed\" }} 个"
 }`))
 	if err != nil {
 		log.Fatal(err)

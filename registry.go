@@ -21,11 +21,13 @@ var (
 
 // registration is one registered node type.
 type registration struct {
-	kind  string
-	fn    any
-	info  NodeInfo
-	ctor  constructor
-	order int // registration order, for stable ListTypes output
+	kind string
+	info NodeInfo
+	ctor constructor
+	// cfgSchema is info.Config compiled once. A kind's config schema cannot
+	// change after registration, so compiling it here keeps every Parse and Run
+	// from redoing the work.
+	cfgSchema *schema
 }
 
 // constructor is the normalized form of a registered constructor. It returns a
@@ -71,18 +73,23 @@ func register(kind string, ctor any, opts []Option) error {
 		}
 	}
 
+	// Compile the config schema now: a malformed one is a registration bug, so
+	// it should fail in init() rather than at the first Parse.
+	var cfgSchema *schema
+	if len(info.Config) > 0 {
+		compiled, err := compileSchema(info.Config)
+		if err != nil {
+			return fmt.Errorf("workflowkit: node %q: invalid config schema: %w", kind, err)
+		}
+		cfgSchema = compiled
+	}
+
 	registryMu.Lock()
 	defer registryMu.Unlock()
 	if _, exists := registry[kind]; exists {
 		return fmt.Errorf("workflowkit: node kind %q already registered", kind)
 	}
-	registry[kind] = &registration{
-		kind:  kind,
-		fn:    ctor,
-		info:  info,
-		ctor:  fn,
-		order: len(registry),
-	}
+	registry[kind] = &registration{kind: kind, info: info, ctor: fn, cfgSchema: cfgSchema}
 	return nil
 }
 

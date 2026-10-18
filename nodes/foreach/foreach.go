@@ -17,8 +17,9 @@ import (
 	"github.com/lengzhao/workflowkit"
 )
 
-// DefaultConcurrency caps how many items run at once when the step does not say.
-const DefaultConcurrency = 4
+// defaultConcurrency caps how many items run at once when the step does not say.
+// It takes the core's default so the two cannot drift apart.
+const defaultConcurrency = workflowkit.DefaultConcurrency
 
 func init() {
 	workflowkit.Register("foreach", New,
@@ -28,8 +29,7 @@ func init() {
 		workflowkit.WithExample(map[string]any{
 			"id":          "each",
 			"type":        "foreach",
-			"items":       "{{ .steps.fetch.json.rows }}",
-			"as":          "row",
+			"items":       "{{ dig (readJSON (printf \"%s/rows.json\" .workflow.runDir)) \"rows\" }}",
 			"concurrency": 3,
 			"body": []any{
 				map[string]any{
@@ -47,9 +47,6 @@ func init() {
 type Config struct {
 	// Items is the array to iterate: a template or a literal array.
 	Items any `json:"items" desc:"array to iterate; a template rendering to an array, or a literal array"`
-	// As names the current element for readability. It does not change the
-	// template variable (.item); it documents intent and is available to hosts.
-	As string `json:"as,omitempty" desc:"name of the current element, for readability"`
 	// Concurrency caps how many items run at once. Defaults to 4.
 	Concurrency int `json:"concurrency,omitempty" desc:"max items running at once (default 4)"`
 	// Body is the list of steps to run per element.
@@ -81,7 +78,6 @@ type node struct{ cfg Config }
 // itemResult is one element's outcome, reported in the node's output.
 type itemResult struct {
 	index  int
-	item   any
 	status string
 	err    string
 }
@@ -92,11 +88,11 @@ func (n *node) Run(ctx context.Context, env workflowkit.Env, c *workflowkit.Ctx)
 		return workflowkit.Output{}, err
 	}
 	if len(items) == 0 {
-		return workflowkit.Output{Text: "foreach: no items", Meta: map[string]any{"count": 0}}, nil
+		return workflowkit.Output{Text: "foreach: no items", Data: map[string]any{"count": 0, "failed": 0}}, nil
 	}
 	concurrency := n.cfg.Concurrency
 	if concurrency <= 0 {
-		concurrency = DefaultConcurrency
+		concurrency = defaultConcurrency
 	}
 	if concurrency > len(items) {
 		concurrency = len(items)
@@ -123,9 +119,11 @@ func (n *node) Run(ctx context.Context, env workflowkit.Env, c *workflowkit.Ctx)
 			failures = append(failures, r)
 		}
 	}
+	// The summary goes into Data, so a downstream step reads it with dig, for
+	// example: {{ dig .steps.each.json "failed" }}
 	out := workflowkit.Output{
 		Text: summarize(len(items), len(failures)),
-		Meta: map[string]any{
+		Data: map[string]any{
 			"count":    len(items),
 			"failed":   len(failures),
 			"statuses": statuses(results),
@@ -167,20 +165,15 @@ func (n *node) items(c *workflowkit.Ctx) ([]any, error) {
 
 func (n *node) runItem(ctx context.Context, c *workflowkit.Ctx, index int, item any) itemResult {
 	if ctx.Err() != nil {
-		return itemResult{index: index, item: item, status: "error", err: ctx.Err().Error()}
+		return itemResult{index: index, status: "error", err: ctx.Err().Error()}
 	}
-	body := make([]workflowkit.Step, len(n.cfg.Body))
-	copy(body, n.cfg.Body)
-	// Namespace body step ids per item so results do not collide across items.
-	for i := range body {
-		body[i].ID = fmt.Sprintf("%s[%d].%s", c.StepID, index, body[i].ID)
-	}
+	// The core scopes body step ids per item, so the node just supplies the item.
 	inner := c.WithItem(item, index)
-	_, err := inner.RunSteps(ctx, body)
+	_, err := inner.RunSteps(ctx, n.cfg.Body)
 	if err != nil {
-		return itemResult{index: index, item: item, status: "error", err: err.Error()}
+		return itemResult{index: index, status: "error", err: err.Error()}
 	}
-	return itemResult{index: index, item: item, status: "ok"}
+	return itemResult{index: index, status: "ok"}
 }
 
 func summarize(total, failed int) string {

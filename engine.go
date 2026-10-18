@@ -2,13 +2,13 @@ package workflowkit
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 )
 
 // SpillThreshold is the size beyond which a step's output is written to a file
@@ -20,10 +20,10 @@ const SpillThreshold = 50 * 1024
 // DefaultConcurrency caps how many steps of one dependency level run at once.
 const DefaultConcurrency = 4
 
-// DefaultStepTimeout is not enforced by the core (a step's own timeout is
-// honored, and the outer deadline belongs to the caller) but names the value
-// the estimate uses for steps without one.
-const DefaultStepTimeout = estimateStepTimeout
+// DefaultStepTimeout is the per-step wall clock the duration estimate assumes
+// when a step declares none. The core does not enforce it: a step's own
+// timeoutSeconds is honored, and any outer deadline belongs to the caller.
+const DefaultStepTimeout = 120
 
 // Result is what Run returns. Text is the rendered result template (empty when
 // the definition declares none). Steps holds every step's outcome, so a caller
@@ -79,7 +79,7 @@ func Run(ctx context.Context, wf *Workflow, inputs map[string]any, env Env) (*Re
 		runDir:  runDir,
 		inputs:  inputs,
 		results: map[string]StepResult{},
-		visible: map[string]bool{},
+		nested:  map[string]StepResult{},
 	}
 	res := ex.run(ctx)
 	res.Dir = runDir
@@ -126,9 +126,15 @@ type executor struct {
 	runDir string
 	inputs map[string]any
 
+	// mu guards results and nested. results holds a step's outcome once its
+	// level has finished, which is exactly what a later step may read. nested
+	// holds composite bodies' results, written as they finish and never read by
+	// templates: a body result is visible to the run's audit trail, not to a
+	// sibling step racing in the same level. Keeping the two apart makes "what a
+	// step can see" structural rather than a filter to remember.
 	mu      sync.Mutex
 	results map[string]StepResult
-	visible map[string]bool
+	nested  map[string]StepResult
 }
 
 // run executes the levels and renders the result template.
@@ -162,7 +168,6 @@ func (ex *executor) run(ctx context.Context) *Result {
 		ex.mu.Lock()
 		for id, r := range levelResults {
 			ex.results[id] = r
-			ex.visible[id] = true
 		}
 		ex.mu.Unlock()
 
@@ -188,9 +193,12 @@ func (ex *executor) run(ctx context.Context) *Result {
 	// sub-steps are published too, under their namespaced ids (for example
 	// "each[0].check"), so nested execution stays auditable.
 	ex.mu.Lock()
-	res.Steps = make(map[string]StepResult, len(ex.wf.Steps))
+	res.Steps = make(map[string]StepResult, len(ex.wf.Steps)+len(ex.nested))
 	for _, step := range ex.wf.Steps {
 		res.Steps[step.ID] = StepResult{ID: step.ID, Status: "skipped"}
+	}
+	for id, r := range ex.nested {
+		res.Steps[id] = r
 	}
 	for id, r := range ex.results {
 		res.Steps[id] = r
@@ -203,7 +211,7 @@ func (ex *executor) run(ctx context.Context) *Result {
 		return res
 	}
 	if strings.TrimSpace(ex.wf.Result) != "" {
-		text, err := renderTemplate(ex.wf.scopeName()+".result", ex.wf.Result, ex.templateData())
+		text, err := renderTemplate(ex.wf.scopeName()+".result", ex.wf.Result, ex.resultData())
 		if err != nil {
 			res.Status = "error"
 			res.Err = err
@@ -278,7 +286,7 @@ func (ex *executor) runStep(ctx context.Context, step *Step, item any, index int
 		var end func(Output, error)
 		stepCtx, end = ex.env.Traces.StartStep(stepCtx, step.ID, step.Type)
 		if end != nil {
-			defer func() { end(Output{Text: res.Text}, errFromString(res.Error)) }()
+			defer func() { end(Output{Text: res.Text}, res.Err()) }()
 		}
 	}
 
@@ -303,7 +311,7 @@ func (ex *executor) runStep(ctx context.Context, step *Step, item any, index int
 			return res
 		}
 		lastErr = err
-		if attempt < attempts && !isFinalError(stepCtx, ctx, err) {
+		if attempt < attempts && !noRetry(stepCtx, ctx) {
 			if step.Retry != nil && step.Retry.WaitSeconds > 0 {
 				select {
 				case <-time.After(time.Duration(step.Retry.WaitSeconds) * time.Second):
@@ -362,7 +370,6 @@ func (ex *executor) captureOutput(res *StepResult, step *Step, out Output) {
 	if res.Data == nil {
 		res.Data = parseJSONContent(out.Text)
 	}
-	res.Meta = out.Meta
 }
 
 // spill caps an inline view, writing oversized text to an artifact file and
@@ -373,42 +380,28 @@ func (ex *executor) spill(stepID, content string) (view, path string) {
 	}
 	path = filepath.Join(ex.runDir, sanitizeFileName(stepID)+".out")
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
-		return truncateRunes(content, SpillThreshold), ""
+		return truncate(content, SpillThreshold), ""
 	}
-	return truncateRunes(content, SpillThreshold) + "\n... [full output: " + path + "]", path
+	return truncate(content, SpillThreshold) + "\n... [full output: " + path + "]", path
 }
 
-// snapshot returns a read-only view of the currently visible steps.
-func (ex *executor) snapshot() StepView {
-	ex.mu.Lock()
-	defer ex.mu.Unlock()
-	view := map[string]StepResult{}
-	for id, r := range ex.results {
-		if ex.visible[id] {
-			view[id] = r
-		}
-	}
-	return mapStepView(view)
-}
+// snapshot returns a read-only view over the steps a step may see. It is lazy:
+// building a copy per step would make a run quadratic in step count, and the
+// published map already holds exactly the visible set.
+func (ex *executor) snapshot() StepView { return stepViewView{ex: ex} }
 
-// templateData builds the template context for the workflow result.
-func (ex *executor) templateData() map[string]any {
-	ex.mu.Lock()
-	steps := map[string]any{}
-	for id, r := range ex.results {
-		steps[id] = stepTemplateData(r)
+// resultData builds the template context for the workflow result: the same
+// builder a step uses, with the run's own scope.
+func (ex *executor) resultData() map[string]any {
+	c := &Ctx{
+		StepID: ex.wf.scopeName(),
+		Inputs: ex.inputs,
+		Steps:  ex.snapshot(),
+		Index:  -1,
+		RunDir: ex.runDir,
+		exec:   ex,
 	}
-	ex.mu.Unlock()
-	return map[string]any{
-		"inputs": ex.inputs,
-		"steps":  steps,
-		"workflow": map[string]any{
-			"id":     ex.wf.ID,
-			"runDir": ex.runDir,
-		},
-		"item":  nil,
-		"index": -1,
-	}
+	return c.data()
 }
 
 // stepTemplateData is one step's template-visible shape.
@@ -422,67 +415,72 @@ func stepTemplateData(r StepResult) map[string]any {
 		"text":   r.Text,
 		"path":   r.Path,
 		"json":   jsonData,
-		"meta":   r.Meta,
 		"error":  r.Error,
 	}
 }
 
-// mapStepView is a StepView over a map.
-type mapStepView map[string]StepResult
+// stepViewView reads the executor's published results under its lock. It is the
+// only view a node gets, so "a step sees earlier dependency levels" is enforced
+// by what the map holds, not by a filter.
+type stepViewView struct{ ex *executor }
 
-func (m mapStepView) Get(id string) (StepResult, bool) {
-	r, ok := m[id]
+func (v stepViewView) Get(id string) (StepResult, bool) {
+	v.ex.mu.Lock()
+	defer v.ex.mu.Unlock()
+	r, ok := v.ex.results[id]
 	return r, ok
 }
 
-func (m mapStepView) IDs() []string {
-	ids := make([]string, 0, len(m))
-	for id := range m {
+func (v stepViewView) IDs() []string {
+	v.ex.mu.Lock()
+	defer v.ex.mu.Unlock()
+	ids := make([]string, 0, len(v.ex.results))
+	for id := range v.ex.results {
 		ids = append(ids, id)
 	}
 	return ids
 }
 
-// runStepNested executes a step that belongs to a composite node's body, in the
-// body's item context. Because the core runs it, the body step keeps its own
-// when, retry, timeout and continueOnError.
-func (ex *executor) runStepNested(ctx context.Context, step Step, item any, index int, local *localSteps) StepResult {
-	res := ex.runStep(ctx, &step, item, index, local)
-	ex.mu.Lock()
-	ex.results[step.ID] = res
-	ex.mu.Unlock()
-	if local != nil {
-		local.put(stripNamespace(step.ID), res)
+// scopePrefix builds the id prefix a composite body runs under, from the
+// calling step's id and the item position. It is what keeps two items'
+// results distinct ("each[0].check" vs "each[1].check") without every
+// composite node having to invent its own scheme.
+func scopePrefix(stepID string, index int) string {
+	if index < 0 {
+		return stepID + "."
 	}
-	return res
+	return fmt.Sprintf("%s[%d].", stepID, index)
 }
 
-// runStepsNested executes body steps in declaration order, stopping at the
-// first failure unless that step sets continueOnError.
-func (ex *executor) runStepsNested(ctx context.Context, steps []Step, item any, index int) ([]StepResult, error) {
+// runStepsNested executes a composite body, publishes each step's result under a
+// scoped id, and returns them in declaration order. A body step keeps its own
+// when, retry, timeout and continueOnError because the core runs it.
+//
+// Two id views exist on purpose: the run publishes the scoped id (auditability)
+// while the body sees its steps by declared id (so a body step can write
+// .steps.check rather than .steps.each[0].check).
+func (ex *executor) runStepsNested(ctx context.Context, callerID string, steps []Step, item any, index int) ([]StepResult, error) {
+	prefix := scopePrefix(callerID, index)
 	local := newLocalSteps()
 	out := make([]StepResult, 0, len(steps))
 	for i := range steps {
 		if ctx.Err() != nil {
 			return out, ctx.Err()
 		}
-		r := ex.runStepNested(ctx, steps[i], item, index, local)
-		out = append(out, r)
-		if r.Status == "error" && !steps[i].ContinueOnError {
-			return out, fmt.Errorf("step %q: %s", steps[i].ID, r.Error)
+		declared := steps[i].ID
+		scoped := *steps[i].withScopedID(prefix + declared)
+		res := ex.runStep(ctx, &scoped, item, index, local)
+		res.ID = declared
+		ex.mu.Lock()
+		ex.nested[scoped.ID] = res
+		ex.mu.Unlock()
+		local.put(declared, res)
+		out = append(out, res)
+		if res.Status == "error" && !steps[i].ContinueOnError {
+			return out, fmt.Errorf("step %q: %s", declared, res.Error)
 		}
 	}
 	return out, nil
-}
-
-// stripNamespace recovers a body step's declared id from the namespaced id a
-// composite uses for global uniqueness ("each[0].check" -> "check").
-func stripNamespace(id string) string {
-	idx := strings.LastIndex(id, ".")
-	if idx < 0 {
-		return id
-	}
-	return id[idx+1:]
 }
 
 // emit sends a step-level event when a sink is configured.
@@ -513,11 +511,18 @@ func sanitizeFileName(name string) string {
 	}, name)
 }
 
-func truncateRunes(s string, max int) string {
+// truncate caps a string at max BYTES without splitting a rune. The old version
+// took max as a rune count, so a 3-bytes-per-char payload produced an inline
+// view three times the intended size — the spill invariant is about bytes.
+func truncate(s string, max int) string {
 	if len(s) <= max {
 		return s
 	}
-	return string([]rune(s)[:max/2]) + "..."
+	limit := max
+	for limit > 0 && !utf8.RuneStart(s[limit]) {
+		limit--
+	}
+	return s[:limit] + "..."
 }
 
 func stepTimeoutError(step *Step) error {
@@ -536,30 +541,8 @@ func errorsIsDeadline(stepCtx, parent context.Context) bool {
 	return parent.Err() == nil
 }
 
-// isFinalError reports whether a retry should be skipped: timeouts and
-// cancellation are not worth retrying.
-func isFinalError(stepCtx, parent context.Context, err error) bool {
-	if errorsIsDeadline(stepCtx, parent) {
-		return true
-	}
-	if parent.Err() != nil {
-		return true
-	}
-	return false
-}
-
-func errFromString(s string) error {
-	if s == "" {
-		return nil
-	}
-	return fmt.Errorf("%s", s)
-}
-
-// marshalCompact renders a value as compact JSON, for event payloads.
-func marshalCompact(v any) string {
-	raw, err := json.Marshal(v)
-	if err != nil {
-		return ""
-	}
-	return string(raw)
+// noRetry reports whether a failure is not worth retrying: a step timeout or a
+// cancelled run will not succeed on a second attempt.
+func noRetry(stepCtx, parent context.Context) bool {
+	return errorsIsDeadline(stepCtx, parent) || parent.Err() != nil
 }

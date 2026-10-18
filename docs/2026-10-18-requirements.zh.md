@@ -326,7 +326,7 @@ type ToolCatalog interface {
 { "id": "fetch", "type": "http", "url": "https://api/x?d={{ .inputs.date }}", "method": "GET",
   "dependsOn": [] }                                  // 并行起步（自定义节点）
 
-{ "id": "each", "type": "foreach", "items": "{{ .steps.fetch.json.rows }}", "as": "row",
+{ "id": "each", "type": "foreach", "items": "{{ dig .steps.fetch.json \"rows\" }}",
   "concurrency": 3,
   "body": [ { "id": "save", "type": "tool", "tool": "db__insert",
               "args": { "row": "{{ .item }}" } } ] }  // 组合节点：body 由节点自己执行

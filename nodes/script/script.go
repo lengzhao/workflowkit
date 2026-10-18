@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/lengzhao/workflowkit"
 )
@@ -84,15 +85,20 @@ func (n *node) Run(ctx context.Context, env workflowkit.Env, c *workflowkit.Ctx)
 	}
 	if exitCode != 0 {
 		return workflowkit.Output{Text: combined},
-			fmt.Errorf("script step %q: exit code %d: %s", c.StepID, exitCode, truncate(stderr+stdout))
+			fmt.Errorf("script step %q: exit code %d: %s", c.StepID, exitCode, snippet(stderr+stdout))
 	}
-	return workflowkit.Output{Text: combined, Data: nil}, nil
+	return workflowkit.Output{Text: combined}, nil
 }
 
-func truncate(s string) string {
+// snippet keeps an error message short while staying on a rune boundary.
+func snippet(s string) string {
 	s = strings.TrimSpace(s)
 	if len(s) <= 400 {
 		return s
 	}
-	return string([]rune(s)[:200]) + "..."
+	limit := 400
+	for limit > 0 && !utf8.RuneStart(s[limit]) {
+		limit--
+	}
+	return s[:limit] + "..."
 }

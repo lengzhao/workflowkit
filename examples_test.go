@@ -66,13 +66,16 @@ func TestAgentComposesLoop(t *testing.T) {
 	if len(tools) == 0 {
 		t.Fatal("the catalog should list tools")
 	}
+	// Pick a known tool rather than the first one: the catalog's order is not
+	// significant, and the definition must match the tool it actually calls.
+	const toolName = "ledger__import"
 
 	// 2) A generated definition, built only from what the briefing offered.
 	generated := `{
 	  "description": "generated",
 	  "steps": [
 	    {"id":"count","type":"script","run":"printf '{\"rows\":17}'"},
-	    {"id":"submit","type":"tool","tool":"` + tools[0].Name + `",
+	    {"id":"submit","type":"tool","tool":"` + toolName + `",
 	     "args":{"rows":"{{ dig .steps.count.json \"rows\" }}"}}
 	  ],
 	  "result": "rows={{ dig .steps.submit.json \"rows\" }}"

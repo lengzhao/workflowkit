@@ -2,6 +2,7 @@ package workflowkit
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 )
@@ -26,12 +27,10 @@ type Node interface {
 //
 // Text becomes .text (spilled to a file beyond the spill threshold, in which
 // case .path holds the location). Data becomes .json when it is an object or
-// array, so dig can walk it. Meta is extra template-readable information (for
-// example an agent's child session id).
+// array, so dig can walk it. A node that wants to expose more puts it in Data.
 type Output struct {
 	Text string
 	Data any
-	Meta map[string]any
 }
 
 // Ctx is the per-step execution context handed to a node. A node reads its own
@@ -98,17 +97,25 @@ type StepView interface {
 	IDs() []string
 }
 
+// Err returns the step's error, or nil when it succeeded. Error is the string
+// form for JSON; this is the convenient form for Go callers.
+func (r StepResult) Err() error {
+	if r.Error == "" {
+		return nil
+	}
+	return errors.New(r.Error)
+}
+
 // StepResult is one step's outcome, both for templates (.steps.<id>) and for
 // the caller (Result.Steps).
 type StepResult struct {
-	ID       string         `json:"id"`
-	Status   string         `json:"status"` // ok / error / skipped
-	Text     string         `json:"text,omitempty"`
-	Path     string         `json:"path,omitempty"`
-	Data     any            `json:"data,omitempty"`
-	Meta     map[string]any `json:"meta,omitempty"`
-	Error    string         `json:"error,omitempty"`
-	Duration float64        `json:"durationSeconds,omitempty"`
+	ID       string  `json:"id"`
+	Status   string  `json:"status"` // ok / error / skipped
+	Text     string  `json:"text,omitempty"`
+	Path     string  `json:"path,omitempty"`
+	Data     any     `json:"data,omitempty"`
+	Error    string  `json:"error,omitempty"`
+	Duration float64 `json:"durationSeconds,omitempty"`
 }
 
 // Env carries host capabilities into Run. Every field is optional: a
@@ -229,17 +236,11 @@ func (c *Ctx) Value(text string) (any, error) {
 	return renderValue(text, c.data())
 }
 
-// Values deep-renders templates inside a map, for node configs holding nested
-// structures (tool args, HTTP bodies). Each string leaf is rendered with Value.
+// Values deep-renders templates inside a nested structure (a map, a slice, or a
+// scalar), for node configs holding compound data such as tool args or an HTTP
+// body. Each string leaf is rendered with Value's type preservation.
 func (c *Ctx) Values(value any) (any, error) {
 	return renderValue(value, c.data())
-}
-
-// Sub derives a context for a nested step, optionally inside a foreach body.
-func (c *Ctx) Sub(stepID string) *Ctx {
-	next := *c
-	next.StepID = stepID
-	return &next
 }
 
 // WithItem derives a context whose .item and .index are set, for a foreach body.
@@ -257,7 +258,14 @@ func (c *Ctx) RunStep(ctx context.Context, step Step) (StepResult, error) {
 	if c.exec == nil {
 		return StepResult{}, fmt.Errorf("workflowkit: step %q: no executor (node built outside Run)", c.StepID)
 	}
-	return c.exec.runStepNested(ctx, step, c.Item, c.Index, c.local), nil
+	results, err := c.exec.runStepsNested(ctx, c.StepID, []Step{step}, c.Item, c.Index)
+	if len(results) == 0 {
+		if err != nil {
+			return StepResult{}, err
+		}
+		return StepResult{}, nil
+	}
+	return results[0], nil
 }
 
 // RunSteps executes sub-steps in declaration order, stopping at the first
@@ -267,8 +275,9 @@ func (c *Ctx) RunSteps(ctx context.Context, steps []Step) ([]StepResult, error) 
 		return nil, fmt.Errorf("workflowkit: step %q: no executor (node built outside Run)", c.StepID)
 	}
 	// A fresh local view per call: this body's steps see each other by their
-	// declared ids, independent of other items running concurrently.
-	return c.exec.runStepsNested(ctx, steps, c.Item, c.Index)
+	// declared ids, independent of other items running concurrently. The caller's
+	// id and the item index become the scope prefix the run publishes under.
+	return c.exec.runStepsNested(ctx, c.StepID, steps, c.Item, c.Index)
 }
 
 // DefinitionDir is the directory holding the definition file, or "" for a
@@ -280,7 +289,9 @@ func (c *Ctx) DefinitionDir() string {
 	return c.exec.wf.Dir
 }
 
-// data builds the template context for this step.
+// data builds the template context for this step. It is the single builder for
+// both a step's templates and the workflow result's, so the two can never
+// diverge.
 func (c *Ctx) data() map[string]any {
 	steps := map[string]any{}
 	if c.Steps != nil {

@@ -94,10 +94,10 @@ func WithSubSteps(fields ...string) Option {
 	}
 }
 
-// StepsSchema returns the JSON Schema for an array of steps, for node config
-// schemas that accept sub-steps (with WithSubSteps). It only requires the shape
+// stepsSchema is the JSON Schema for an array of steps, used by node config
+// schemas that accept sub-steps (see WithSubSteps). It only requires the shape
 // every step has; the core validates ids and node-specific fields recursively.
-func StepsSchema() map[string]any {
+func stepsSchema() map[string]any {
 	return map[string]any{
 		"type": "array",
 		"items": map[string]any{
@@ -183,7 +183,7 @@ func schemaFromType(t reflect.Type) (map[string]any, error) {
 		return map[string]any{"type": "object"}, nil
 	}
 	if (t.Kind() == reflect.Slice || t.Kind() == reflect.Array) && t.Elem() == stepType {
-		return StepsSchema(), nil
+		return stepsSchema(), nil
 	}
 	switch t.Kind() {
 	case reflect.String:
@@ -223,11 +223,11 @@ func schemaFromType(t reflect.Type) (map[string]any, error) {
 	}
 }
 
-// CheckConfig builds a node from a step's fields to surface node-level errors —
+// checkConfig builds a node from a step's fields to surface node-level errors —
 // a missing required field or a misspelled one — at load time rather than at
 // the first Run. Parse calls it; a definition that passes validation is known
 // to construct.
-func CheckConfig(kind string, fields map[string]any) error {
+func checkConfig(kind string, fields map[string]any) error {
 	reg, ok := lookup(kind)
 	if !ok {
 		return fmt.Errorf("unknown type %q", kind)

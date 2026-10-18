@@ -11,29 +11,49 @@ import (
 	"github.com/santhosh-tekuri/jsonschema/v6"
 )
 
-// validateAgainstSchema checks a value against a JSON Schema. Both node configs
-// at load time and model-step outputs at run time go through here.
-func validateAgainstSchema(schema map[string]any, value any) error {
-	doc, err := toJSONDocument(schema)
+// schema is a compiled JSON Schema. Compiling is expensive, so a schema that
+// cannot change after registration (a node kind's config) is compiled once and
+// reused; only per-definition schemas are compiled per call.
+type schema struct{ inner *jsonschema.Schema }
+
+// compileSchema compiles a schema, reporting a malformed one immediately.
+func compileSchema(raw map[string]any) (*schema, error) {
+	doc, err := toJSONDocument(raw)
 	if err != nil {
-		return fmt.Errorf("parse schema: %w", err)
+		return nil, fmt.Errorf("parse schema: %w", err)
 	}
 	compiler := jsonschema.NewCompiler()
 	if err := compiler.AddResource("schema.json", doc); err != nil {
-		return fmt.Errorf("load schema: %w", err)
+		return nil, fmt.Errorf("load schema: %w", err)
 	}
 	compiled, err := compiler.Compile("schema.json")
 	if err != nil {
-		return fmt.Errorf("compile schema: %w", err)
+		return nil, fmt.Errorf("compile schema: %w", err)
 	}
-	doc2, err := toJSONDocument(value)
+	return &schema{inner: compiled}, nil
+}
+
+// Validate checks a value against the compiled schema.
+func (s *schema) Validate(value any) error {
+	if s == nil || s.inner == nil {
+		return nil
+	}
+	doc, err := toJSONDocument(value)
 	if err != nil {
 		return fmt.Errorf("parse value: %w", err)
 	}
-	if err := compiled.Validate(doc2); err != nil {
+	return s.inner.Validate(doc)
+}
+
+// validateAgainstSchema checks a value against a JSON Schema given as data, for
+// schemas that are not known at registration time (a workflow's inputs, a
+// model step's outputSchema).
+func validateAgainstSchema(raw map[string]any, value any) error {
+	compiled, err := compileSchema(raw)
+	if err != nil {
 		return err
 	}
-	return nil
+	return compiled.Validate(value)
 }
 
 // toJSONDocument round-trips a Go value through encoding/json so the schema
@@ -61,7 +81,7 @@ func Schema() map[string]any {
 			"description": map[string]any{"type": "string", "description": "one line; callers route by it"},
 			"inputs":      map[string]any{"type": "object", "description": "JSON Schema of the arguments Run accepts"},
 			"concurrency": map[string]any{"type": "integer", "minimum": 0, "description": "max steps of one dependency level running at once (default 4)"},
-			"steps":       StepsSchema(),
+			"steps":       stepsSchema(),
 			"result":      map[string]any{"type": "string", "description": "template rendered into Result.Text; optional"},
 		},
 		"additionalProperties": false,
@@ -207,12 +227,9 @@ func levels(steps []Step) [][]int {
 	return out
 }
 
-// estimateTimeout is the default per-step timeout used by the duration
-// estimate when a step declares none. Agent steps use the larger default.
-const (
-	estimateStepTimeout  = 120
-	estimateAgentTimeout = 900
-)
+// estimateAgentTimeout is what the duration estimate assumes for an agent step
+// that declares no timeout (subagent delegation is long-running by nature).
+const estimateAgentTimeout = 900
 
 // EstimateDuration estimates the run's wall clock as the critical path (the
 // longest dependency chain) of per-step timeouts, in seconds. Serial workflows
@@ -260,7 +277,7 @@ func stepTimeoutSeconds(step *Step) int {
 	case "agent":
 		return estimateAgentTimeout
 	default:
-		return estimateStepTimeout
+		return DefaultStepTimeout
 	}
 }
 
@@ -292,17 +309,7 @@ func ValidateSchema(schema map[string]any, value any) error {
 // CompileSchema reports whether a JSON Schema is well-formed. Node
 // constructors call it so a malformed schema fails at load time rather than at
 // the first Run.
-func CompileSchema(schema map[string]any) error {
-	doc, err := toJSONDocument(schema)
-	if err != nil {
-		return fmt.Errorf("parse schema: %w", err)
-	}
-	compiler := jsonschema.NewCompiler()
-	if err := compiler.AddResource("schema.json", doc); err != nil {
-		return fmt.Errorf("load schema: %w", err)
-	}
-	if _, err := compiler.Compile("schema.json"); err != nil {
-		return fmt.Errorf("compile schema: %w", err)
-	}
-	return nil
+func CompileSchema(raw map[string]any) error {
+	_, err := compileSchema(raw)
+	return err
 }

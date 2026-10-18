@@ -31,9 +31,9 @@ import (
 
 // Briefing is the catalogue a model needs before writing a definition.
 type Briefing struct {
-	Kinds []KindBrief  `json:"kinds"`
-	Tools []ToolBrief  `json:"tools"`
-	Rules []string     `json:"rules"`
+	Kinds      []KindBrief    `json:"kinds"`
+	Tools      []ToolBrief    `json:"tools"`
+	Rules      []string       `json:"rules"`
 	MinimalDef map[string]any `json:"minimalDefinition"`
 }
 

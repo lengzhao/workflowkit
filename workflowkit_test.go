@@ -10,6 +10,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/lengzhao/workflowkit"
 	// The blank import registers the built-in node kinds, exactly as a host does.
@@ -463,7 +464,6 @@ func TestBigIntegerSurvivesStepToStep(t *testing.T) {
 	_ = tools
 }
 
-
 func TestObjectArgIsPassedAsObject(t *testing.T) {
 	wf := mustParse(t, `{"description":"d","steps":[
 		{"id":"a","type":"tool","tool":"emit"},
@@ -551,8 +551,9 @@ func TestAgentStep(t *testing.T) {
 	if res.Steps["a"].Text != "looks fine" {
 		t.Fatalf("unexpected summary %q", res.Steps["a"].Text)
 	}
-	if res.Steps["a"].Meta["session"] != "sess-1" {
-		t.Fatalf("expected the child session in meta, got %#v", res.Steps["a"].Meta)
+	data, ok := res.Steps["a"].Data.(map[string]any)
+	if !ok || data["session"] != "sess-1" {
+		t.Fatalf("expected the child session in the step data, got %#v", res.Steps["a"].Data)
 	}
 }
 
@@ -579,8 +580,8 @@ func TestForeach(t *testing.T) {
 	if len(tools.calls) != 3 {
 		t.Fatalf("expected 3 tool calls, got %d", len(tools.calls))
 	}
-	if res.Steps["each"].Meta["count"] != 3 {
-		t.Fatalf("expected count 3, got %#v", res.Steps["each"].Meta)
+	if m := stepData(res, "each"); m["count"] != 3 {
+		t.Fatalf("expected count 3, got %#v", m)
 	}
 }
 
@@ -612,8 +613,8 @@ func TestForeachItemErrorContinues(t *testing.T) {
 	if err != nil {
 		t.Fatalf("onItemError=continue should not fail the run: %v", err)
 	}
-	if res.Steps["each"].Meta["failed"] != 1 {
-		t.Fatalf("expected 1 failed item, got %#v", res.Steps["each"].Meta)
+	if m := stepData(res, "each"); m["failed"] != 1 {
+		t.Fatalf("expected 1 failed item, got %#v", m)
 	}
 }
 
@@ -886,6 +887,13 @@ func TestReadJSONStaysInsideAllowedDirs(t *testing.T) {
 func jsonMarshal(v any) ([]byte, error) {
 	return json.Marshal(v)
 }
+
+// stepData returns a step's structured output as a map, for assertions.
+func stepData(res *workflowkit.Result, id string) map[string]any {
+	m, _ := res.Steps[id].Data.(map[string]any)
+	return m
+}
+
 // ---------------------------------------------------------------------------
 // Composite nodes: item context, sibling references and auditability
 // ---------------------------------------------------------------------------
@@ -940,5 +948,30 @@ func TestForeachItemIsolation(t *testing.T) {
 		if call.Input["text"] != "same" {
 			t.Fatalf("item did not see its own sibling result: %#v", call.Input)
 		}
+	}
+}
+
+// TestSpillThresholdHoldsForMultibyte guards the byte/rune confusion the
+// truncation once had: with CJK text (3 bytes per rune) an inline view sized by
+// rune count is three times the threshold, which breaks the "large payloads
+// never travel inline" invariant.
+func TestSpillThresholdHoldsForMultibyte(t *testing.T) {
+	payload := strings.Repeat("交易日数据", 20000) // 300KB
+	wf := mustParse(t, `{"description":"d","steps":[{"id":"a","type":"script","run":"cmd"}]}`)
+	env, shell, _ := testEnv(t)
+	shell.out["cmd"] = payload
+	res, err := workflowkit.Run(context.Background(), wf, nil, env)
+	if err != nil {
+		t.Fatalf("run failed: %v", err)
+	}
+	a := res.Steps["a"]
+	if len(a.Text) > workflowkit.SpillThreshold+200 {
+		t.Fatalf("inline view is %d bytes, over the %d threshold", len(a.Text), workflowkit.SpillThreshold)
+	}
+	if !utf8.ValidString(a.Text) {
+		t.Fatal("truncation split a rune, producing invalid UTF-8")
+	}
+	if a.Path == "" {
+		t.Fatal("a 300KB payload should have been spilled")
 	}
 }

@@ -856,6 +856,69 @@ func TestLoadAndLoadDirs(t *testing.T) {
 	}
 }
 
+// TestConcurrencyOmittedVsZero is the point of the *int field: an omitted limit
+// uses the default, an explicit 0 means no limit. With an int both would be 0
+// and the two cases could not be told apart.
+func TestConcurrencyOmittedVsZero(t *testing.T) {
+	// Four steps, each sleeping 100ms. Omitted (default 4) runs them at once;
+	// an explicit 1 serialises them.
+	mk := func(conc string) *workflowkit.Workflow {
+		def := `{"description":"d"` + conc + `,"steps":[
+			{"id":"a","type":"script","run":"cmd","dependsOn":[]},
+			{"id":"b","type":"script","run":"cmd","dependsOn":[]},
+			{"id":"c","type":"script","run":"cmd","dependsOn":[]},
+			{"id":"d","type":"script","run":"cmd","dependsOn":[]}]}`
+		return mustParse(t, def)
+	}
+	elapsed := func(wf *workflowkit.Workflow) time.Duration {
+		env, shell, _ := testEnv(t)
+		shell.delay = 100 * time.Millisecond
+		start := time.Now()
+		if _, err := workflowkit.Run(context.Background(), wf, nil, env); err != nil {
+			t.Fatalf("run failed: %v", err)
+		}
+		return time.Since(start)
+	}
+
+	if got := elapsed(mk("")); got > 250*time.Millisecond {
+		t.Fatalf("an omitted limit should run the level at once, took %s", got)
+	}
+	if got := elapsed(mk(`,"concurrency":0`)); got > 250*time.Millisecond {
+		t.Fatalf("concurrency 0 means no limit, took %s", got)
+	}
+	if got := elapsed(mk(`,"concurrency":1`)); got < 350*time.Millisecond {
+		t.Fatalf("concurrency 1 should serialise the level, took %s", got)
+	}
+}
+
+func TestConcurrencyNegativeRejected(t *testing.T) {
+	_, err := workflowkit.Parse([]byte(`{"description":"d","concurrency":-1,"steps":[{"id":"a","type":"script","run":"x"}]}`))
+	if err == nil || !strings.Contains(err.Error(), "must not be negative") {
+		t.Fatalf("expected a rejection, got %v", err)
+	}
+	// The schema derivation turns *int into integer, so a negative value also
+	// has to survive the schema pass to reach that check.
+	if _, err := workflowkit.Parse([]byte(`{"description":"d","concurrency":2,"steps":[{"id":"a","type":"script","run":"x"}]}`)); err != nil {
+		t.Fatalf("a positive limit must be accepted: %v", err)
+	}
+}
+
+func TestForeachConcurrencyUnlimited(t *testing.T) {
+	// 6 items, 50ms each: unlimited finishes in about one item's time.
+	wf := mustParse(t, `{"description":"d","steps":[
+		{"id":"each","type":"foreach","items":"[1,2,3,4,5,6]","concurrency":0,
+		 "body":[{"id":"work","type":"script","run":"cmd"}]}]}`)
+	env, shell, _ := testEnv(t)
+	shell.delay = 50 * time.Millisecond
+	start := time.Now()
+	if _, err := workflowkit.Run(context.Background(), wf, nil, env); err != nil {
+		t.Fatalf("run failed: %v", err)
+	}
+	if got := time.Since(start); got > 200*time.Millisecond {
+		t.Fatalf("concurrency 0 should not serialise items, took %s", got)
+	}
+}
+
 func TestEstimateDurationUsesCriticalPath(t *testing.T) {
 	// Serial chain: 10 + 20 = 30. A parallel branch of 100 does not add on.
 	wf := mustParse(t, `{"description":"d","steps":[

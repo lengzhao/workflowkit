@@ -17,10 +17,6 @@ import (
 	"github.com/lengzhao/workflowkit"
 )
 
-// defaultConcurrency caps how many items run at once when the step does not say.
-// It takes the core's default so the two cannot drift apart.
-const defaultConcurrency = workflowkit.DefaultConcurrency
-
 func init() {
 	workflowkit.Register("foreach", New,
 		workflowkit.WithDescription("Run a body of steps once per element of an array, with .item and .index set for each element."),
@@ -47,8 +43,9 @@ func init() {
 type Config struct {
 	// Items is the array to iterate: a template or a literal array.
 	Items any `json:"items" desc:"array to iterate; a template rendering to an array, or a literal array"`
-	// Concurrency caps how many items run at once. Defaults to 4.
-	Concurrency int `json:"concurrency,omitempty" desc:"max items running at once (default 4)"`
+	// Concurrency caps how many items run at once. Omitted uses the default (4);
+	// 0 means no limit, which is the usual choice for a rate-limited API.
+	Concurrency *int `json:"concurrency,omitempty" desc:"max items running at once (default 4, 0 = no limit)"`
 	// Body is the list of steps to run per element.
 	Body []workflowkit.Step `json:"body" desc:"steps to run for each element"`
 	// OnItemError is "fail" (default) or "continue". With "continue", an item
@@ -82,6 +79,15 @@ type itemResult struct {
 	err    string
 }
 
+// slotCount sizes the semaphore, where 0 means no limit. A buffered channel
+// needs a positive capacity, so "no limit" becomes the item count.
+func slotCount(limit, n int) int {
+	if limit <= 0 {
+		return n
+	}
+	return limit
+}
+
 func (n *node) Run(ctx context.Context, env workflowkit.Env, c *workflowkit.Ctx) (workflowkit.Output, error) {
 	items, err := n.items(c)
 	if err != nil {
@@ -90,16 +96,11 @@ func (n *node) Run(ctx context.Context, env workflowkit.Env, c *workflowkit.Ctx)
 	if len(items) == 0 {
 		return workflowkit.Output{Text: "foreach: no items", Data: map[string]any{"count": 0, "failed": 0}}, nil
 	}
-	concurrency := n.cfg.Concurrency
-	if concurrency <= 0 {
-		concurrency = defaultConcurrency
+	if err := workflowkit.ValidateConcurrency(n.cfg.Concurrency); err != nil {
+		return workflowkit.Output{}, err
 	}
-	if concurrency > len(items) {
-		concurrency = len(items)
-	}
-
 	results := make([]itemResult, len(items))
-	sem := make(chan struct{}, concurrency)
+	sem := make(chan struct{}, slotCount(workflowkit.ResolveConcurrency(n.cfg.Concurrency, len(items)), len(items)))
 	var wg sync.WaitGroup
 	for i, item := range items {
 		i, item := i, item

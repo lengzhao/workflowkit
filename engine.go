@@ -17,7 +17,8 @@ import (
 // caller's context.
 const SpillThreshold = 50 * 1024
 
-// DefaultConcurrency caps how many steps of one dependency level run at once.
+// DefaultConcurrency caps how many steps of one dependency level run at once
+// when the workflow does not say. Set concurrency to 0 for no limit.
 const DefaultConcurrency = 4
 
 // DefaultStepTimeout is the per-step wall clock the duration estimate assumes
@@ -148,10 +149,7 @@ func (ex *executor) run(ctx context.Context) *Result {
 		return res
 	}
 
-	concurrency := ex.wf.Concurrency
-	if concurrency <= 0 {
-		concurrency = DefaultConcurrency
-	}
+	concurrency := ResolveConcurrency(ex.wf.Concurrency, 0)
 
 	var failed error
 	for _, level := range plan {
@@ -222,7 +220,8 @@ func (ex *executor) run(ctx context.Context) *Result {
 	return res
 }
 
-// runLevel executes one dependency level, up to concurrency steps at a time.
+// runLevel executes one dependency level, up to the effective concurrency at a
+// time. A limit of 0 means no limit.
 func (ex *executor) runLevel(ctx context.Context, level []int, concurrency int) map[string]StepResult {
 	out := make(map[string]StepResult, len(level))
 	if len(level) == 1 {
@@ -230,7 +229,7 @@ func (ex *executor) runLevel(ctx context.Context, level []int, concurrency int) 
 		out[step.ID] = ex.runStep(ctx, step, nil, -1, nil)
 		return out
 	}
-	sem := make(chan struct{}, concurrency)
+	sem := make(chan struct{}, slotCount(concurrency, len(level)))
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	for _, idx := range level {
@@ -249,6 +248,14 @@ func (ex *executor) runLevel(ctx context.Context, level []int, concurrency int) 
 	}
 	wg.Wait()
 	return out
+}
+
+// slotCount sizes the semaphore for a limit, where 0 means no limit.
+func slotCount(limit, n int) int {
+	if limit <= 0 {
+		return n
+	}
+	return limit
 }
 
 // runStep executes one step: evalWhen, retries, timeout and output capture.

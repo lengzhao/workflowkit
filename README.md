@@ -114,8 +114,9 @@ Run(ctx, wf, inputs, env)
 ### Execution
 
 Levels are derived from the dependency graph (a serial pipeline is one chain).
-Steps within a level run concurrently up to `concurrency`. A join is simply a
-step that depends on several steps — no fan-in node exists. A failing step lets
+Steps within a level run concurrently up to `concurrency` — omit it for the
+default (4), set `0` for no limit. A join is simply a step that depends on
+several steps — no fan-in node exists. A failing step lets
 its level finish and then stops the run before the next level; `continueOnError`
 overrides that. The library sets no outer deadline: size your own with
 `wf.EstimateDuration()`, the critical path of step timeouts.
@@ -152,7 +153,7 @@ integers above 2^53 are not rounded), and a static `"42"` stays a string.
 | `tool` | `tool`, `args` | `Env.Tools` |
 | `model` | `prompt`, `model`, `system`, `outputSchema`, `maxInputBytes` | `Env.LLM` |
 | `agent` | `agent`, `task` | `Env.Agents` |
-| `foreach` | `items`, `as`, `concurrency`, `body`, `onItemError` | — (uses the core) |
+| `foreach` | `items`, `concurrency`, `body`, `onItemError` | — (uses the core) |
 
 ## Capabilities
 

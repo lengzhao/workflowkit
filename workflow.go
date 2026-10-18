@@ -18,7 +18,8 @@ type Workflow struct {
 	// Inputs is the JSON Schema of the arguments Run accepts.
 	Inputs map[string]any `json:"inputs,omitempty"`
 	// Concurrency caps how many steps of one dependency level run at once.
-	Concurrency int `json:"concurrency,omitempty"`
+	// Omitted uses DefaultConcurrency; 0 means no limit.
+	Concurrency *int `json:"concurrency,omitempty"`
 	// Steps are the pipeline stages, in declaration order.
 	Steps []Step `json:"steps"`
 	// Result is a template rendered into Result.Text. Optional: without it the
@@ -167,8 +168,8 @@ func (wf *Workflow) validate() error {
 	if len(wf.Steps) == 0 {
 		return fmt.Errorf("workflow %q: at least one step is required", scope)
 	}
-	if wf.Concurrency < 0 {
-		return fmt.Errorf("workflow %q: concurrency must not be negative", scope)
+	if err := ValidateConcurrency(wf.Concurrency); err != nil {
+		return fmt.Errorf("workflow %q: %w", scope, err)
 	}
 	if err := validateStepList(scope, wf.Steps); err != nil {
 		return err

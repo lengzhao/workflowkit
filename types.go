@@ -7,6 +7,39 @@ import (
 	"sync"
 )
 
+// A concurrency limit is a *int because presence carries meaning: nil (the
+// field is absent) means "use the default", an explicit 0 means "no limit", and
+// a positive value is the cap. ResolveConcurrency and ValidateConcurrency
+// implement that rule once, so the workflow level and every composite node agree.
+
+// ResolveConcurrency returns the effective limit for a workload of n items, or 0
+// for no limit. n may be 0 when the workload size is unknown.
+func ResolveConcurrency(set *int, n int) int {
+	if set != nil && *set == 0 {
+		return 0 // explicit no-limit
+	}
+	limit := DefaultConcurrency
+	if set != nil {
+		limit = *set
+	}
+	if n > 0 && limit > n {
+		limit = n
+	}
+	return limit
+}
+
+// ValidateConcurrency rejects a negative limit, which has no meaning.
+func ValidateConcurrency(set *int) error {
+	if set != nil && *set < 0 {
+		return fmt.Errorf("concurrency must not be negative (use 0 for no limit)")
+	}
+	return nil
+}
+
+// Int returns a pointer to v, for setting a concurrency limit in a Go literal,
+// for example Concurrency: workflowkit.Int(0) for no limit.
+func Int(v int) *int { return &v }
+
 // Node is one executable step. A node type's constructor returns a value
 // implementing this interface.
 //
